@@ -1,0 +1,142 @@
+/************************************************************
+ * CONFIG
+ ************************************************************/
+const TEMPLATE_ID = "YOUR_TEMPLATE_DOC_ID";   // Google Docs template ID
+const FOLDER_ID   = "YOUR_FOLDER_ID";         // Drive folder for PDFs
+const DAILY_TRIGGER_HOUR = 7;                 // time for daily retry trigger
+
+
+/************************************************************
+ * STEP 1: Form Submit
+ * - Generate certificate from template
+ * - Save PDF to Drive folder
+ * - Try to send immediately (if quota available)
+ * - If quota exceeded, mark as PENDING
+ ************************************************************/
+function onFormSubmit(e) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const logSheet = ss.getSheetByName("Log") || ss.insertSheet("Log");
+
+  // Create log header if empty
+  if (logSheet.getLastRow() === 0) {
+    logSheet.appendRow(["Timestamp", "Status", "Name", "Email", "Certificate Link", "Info/Error"]);
+  }
+
+  const responses = e.values;
+  const timestamp = responses[0];
+  const name      = responses[1]; // Adjust column index based on your Form
+  const email     = responses[2];
+
+  try {
+    // Make certificate from template
+    const template = DriveApp.getFileById(TEMPLATE_ID);
+    const copy = template.makeCopy("Certificate - " + name, DriveApp.getFolderById(FOLDER_ID));
+    const doc = DocumentApp.openById(copy.getId());
+    doc.getBody().replaceText("{{NAME}}", name);
+    doc.saveAndClose();
+
+    // Export PDF
+    const pdf = copy.getAs("application/pdf");
+    const pdfFile = DriveApp.getFolderById(FOLDER_ID).createFile(pdf).setName("Certificate - " + name + ".pdf");
+    copy.setTrashed(true); // delete Docs copy (optional)
+
+    const link = pdfFile.getUrl();
+    let status = "PENDING";
+    let info   = "";
+
+    // Check email quota
+    if (MailApp.getRemainingDailyQuota() > 0) {
+      try {
+        MailApp.sendEmail({
+          to: email,
+          subject: "Your Certificate",
+          body: "Hello " + name + ",\n\nPlease find your certificate attached.",
+          htmlBody: `<p>Hello <b>${name}</b>,</p>
+                     <p>Thank you for participating in our event.</p>
+                     <p>Your certificate is attached below.</p>
+                     <p><a href="${link}">View in Google Drive</a></p>
+                     <br><p>Best regards,<br>Organizing Committee</p>`,
+          attachments: [pdfFile.getAs("application/pdf")]
+        });
+        status = "SENT";
+      } catch (err) {
+        status = "ERROR";
+        info = err.message;
+      }
+    } else {
+      info = "Quota exceeded, will be sent tomorrow";
+    }
+
+    logSheet.appendRow([timestamp, status, name, email, link, info]);
+  } catch (err) {
+    logSheet.appendRow([timestamp, "ERROR", name, email, "", err.message]);
+  }
+}
+
+
+/************************************************************
+ * STEP 2: Batch Retry
+ * - Check PENDING rows in Log
+ * - Send emails if quota is available
+ ************************************************************/
+function sendPendingCertificates() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const logSheet = ss.getSheetByName("Log");
+  if (!logSheet) return;
+
+  const data = logSheet.getDataRange().getValues();
+  let remainingQuota = MailApp.getRemainingDailyQuota();
+  let sentCount = 0;
+
+  for (let i = 1; i < data.length; i++) {
+    if (remainingQuota <= 0) break;
+
+    const row = data[i];
+    const status = row[1];
+    const name   = row[2];
+    const email  = row[3];
+    const link   = row[4];
+
+    if (status === "PENDING" && email) {
+      try {
+        const fileId = link.split("/d/")[1].split("/")[0];
+        const file = DriveApp.getFileById(fileId);
+
+        MailApp.sendEmail({
+          to: email,
+          subject: "Your Certificate",
+          body: "Hello " + name + ",\n\nPlease find your certificate attached.",
+          htmlBody: `<p>Hello <b>${name}</b>,</p>
+                     <p>Thank you for participating in our event.</p>
+                     <p>Your certificate is attached below.</p>
+                     <p><a href="${link}">View in Google Drive</a></p>
+                     <br><p>Best regards,<br>Organizing Committee</p>`,
+          attachments: [file.getAs("application/pdf")]
+        });
+
+        logSheet.getRange(i + 1, 2).setValue("SENT"); // update status
+        logSheet.getRange(i + 1, 6).setValue("");     // clear info
+        sentCount++;
+        remainingQuota--;
+      } catch (err) {
+        logSheet.getRange(i + 1, 2).setValue("ERROR");
+        logSheet.getRange(i + 1, 6).setValue(err.message);
+      }
+    }
+  }
+
+  Logger.log("Retry finished. Sent: " + sentCount + ". Remaining quota: " + remainingQuota);
+}
+
+
+/************************************************************
+ * STEP 3: Create Daily Trigger
+ * - Runs once per day (e.g., at 7 AM)
+ ************************************************************/
+function createDailyRetryTrigger() {
+  ScriptApp.newTrigger("sendPendingCertificates")
+    .timeBased()
+    .atHour(DAILY_TRIGGER_HOUR)
+    .everyDays(1)
+    .create();
+}
