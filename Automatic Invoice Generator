@@ -11,6 +11,9 @@ const appScriptUrl = ''; // isi url web yang sudah di deploy
 const templateDocId = ''; // isi dengan id template doc invoice
 const folderId = ''; // isi dengan id folder archive invoice
 
+// === Konfigurasi tambahan ===
+const TAX_RATE = 0.11; // 11% — ubah sesuai kebutuhan (mis. 0.10 = 10%)
+
 
 // Webhook utama
 function doPost(e) {
@@ -100,9 +103,9 @@ function processData(chatId, dataText) {
     // Simpan ke Sheet aman
     appendRowsSafe(sheet, tanggal, kepada, items, harga, jumlah);
 
-    // Hitung total
+    // Hitung total dengan TAX_RATE global
     const subTotal = items.reduce((acc, _, i) => acc + harga[i] * jumlah[i], 0);
-    const tax = subTotal * 0.11;
+    const tax = subTotal * TAX_RATE;
     const grandTotal = subTotal + tax;
 
     sendMessage(chatId, "✅ Data berhasil disimpan. Invoice sedang diproses...");
@@ -142,8 +145,27 @@ function appendRowsSafe(sheet, tanggal, kepada, items, harga, jumlah) {
 }
 
 
+// Format rupiah
+function formatRupiah(number) {
+  return "Rp " + Number(number).toLocaleString('id-ID');
+}
+
+
+// Format persen dari TAX_RATE
+function formatPersen(rate) {
+  return (rate * 100).toFixed(0) + "%";
+}
+
+
+// Generate nomor invoice unik
+function generateInvoiceNo(tanggal) {
+  const tgl = Utilities.formatDate(new Date(tanggal), Session.getScriptTimeZone(), "yyyyMMdd");
+  return "INV-" + tgl + "-" + Math.floor(Math.random() * 1000);
+}
+
+
 // Generate PDF
-function generateInvoicePDF(kepada, tanggal, items, harga, jumlah) {
+function generateInvoicePDF(kepada, tanggal, items, harga, jumlah, subTotal, tax, grandTotal) {
   // Buat salinan dokumen template
   const docId = DriveApp.getFileById(templateDocId)
     .makeCopy("Invoice - " + kepada, DriveApp.getFolderById(folderId))
@@ -152,24 +174,44 @@ function generateInvoicePDF(kepada, tanggal, items, harga, jumlah) {
   const doc = DocumentApp.openById(docId);
   const body = doc.getBody();
 
-  // Hitung total
-  const subTotal = items.reduce((acc, _, i) => acc + harga[i] * jumlah[i], 0);
-  const tax = subTotal * 0.11;
-  const grandTotal = subTotal + tax;
-
-  // Generate nomor invoice unik
+  // === Generate nomor invoice unik (misalnya INV-20250924-001) ===
   const invoiceNo = generateInvoiceNo(tanggal);
 
-  // Ganti placeholder di isi PDF
+  // === Ganti placeholder sederhana ===
   body.replaceText('{{INVOICE_NO}}', invoiceNo);
   body.replaceText('{{DATE}}', Utilities.formatDate(new Date(tanggal), Session.getScriptTimeZone(), "dd/MM/yyyy"));
   body.replaceText('{{TO}}', kepada);
   body.replaceText('{{SUBTOTAL}}', formatRupiah(subTotal));
   body.replaceText('{{TAX}}', formatRupiah(tax));
+  body.replaceText('{{TAX_LABEL}}', "Tax (" + formatPersen(TAX_RATE) + ")"); // ⚡ otomatis
   body.replaceText('{{GRAND_TOTAL}}', formatRupiah(grandTotal));
 
-  // Sisipkan tabel item
-  insertItemsTable(body, items, harga, jumlah);
+  // === Cari placeholder tabel {{ITEMS_TABLE}} ===
+  const search = body.findText('{{ITEMS_TABLE}}');
+  if (search) {
+    const el = search.getElement();
+    const paragraph = el.getParent().asParagraph(); // paragraf placeholder
+    el.asText().setText(''); // hapus placeholder
+
+    // Data tabel: header + isi (semua string)
+    const tableData = [["Item", "Harga", "Jumlah", "Total"]];
+
+    for (let i = 0; i < items.length; i++) {
+      tableData.push([
+        items[i].toString(),
+        formatRupiah(harga[i]).toString(),
+        jumlah[i].toString(),
+        formatRupiah(harga[i] * jumlah[i]).toString()
+      ]);
+    }
+
+    // Sisipkan tabel tepat di posisi placeholder
+    const table = body.insertTable(body.getChildIndex(paragraph), tableData);
+
+    // Styling tabel
+    table.getRow(0).editAsText().setBold(true);
+    table.setBorderWidth(1);
+  }
 
   // Simpan & tutup dokumen
   doc.saveAndClose();
@@ -178,58 +220,12 @@ function generateInvoicePDF(kepada, tanggal, items, harga, jumlah) {
   const file = DriveApp.getFileById(docId);
   const pdf = file.getAs(MimeType.PDF);
   const folder = DriveApp.getFolderById(folderId);
-
-  // Gunakan nama file lama (sesuai nama client)
   const pdfFile = folder.createFile(pdf).setName("Invoice - " + kepada + ".pdf");
 
-  // Hapus dokumen sementara
+  // Hapus dokumen sementara (Google Docs)
   file.setTrashed(true);
 
   return pdfFile;
-}
-
-
-// Insert tabel item pada posisi placeholder {{ITEMS_TABLE}}
-function insertItemsTable(body, items, harga, jumlah) {
-  const tableData = [["Item", "Harga", "Jumlah", "Total"]];
-
-  for (let i = 0; i < items.length; i++) {
-    tableData.push([
-      String(items[i]),
-      String(formatRupiah(harga[i])),
-      String(jumlah[i]),
-      String(formatRupiah(harga[i] * jumlah[i]))
-    ]);
-  }
-
-  const search = body.findText('{{ITEMS_TABLE}}');
-  if (!search) return;
-
-  const el = search.getElement();
-  const paragraph = el.getParent().asParagraph();
-
-  // Hapus placeholder tapi tetap simpan posisi
-  el.asText().setText("");
-
-  // Sisipkan tabel tepat di bawah placeholder
-  const table = body.insertTable(body.getChildIndex(paragraph) + 1, tableData);
-
-  // Styling tabel
-  table.getRow(0).editAsText().setBold(true);
-  table.setBorderWidth(1);
-}
-
-
-// Generate Invoice Number
-function generateInvoiceNo(tanggal) {
-  const ts = Utilities.formatDate(new Date(tanggal), Session.getScriptTimeZone(), "yyyyMMddHHmmss");
-  return "INV-" + ts;
-}
-
-
-// Helper format rupiah
-function formatRupiah(number) {
-  return "Rp " + Number(number).toLocaleString('id-ID');
 }
 
 
