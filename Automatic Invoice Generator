@@ -1,0 +1,271 @@
+// Kredensial
+const spreadsheetId = ''; // isi dengan id spreadsheet
+const laporanSheetName = 'Laporan'; // nama sheet utama
+const logSheetName = 'Log'; // nama sheet kedua/log
+
+const botToken = ''; // isi bot token telegram
+const botUrl = 'https://api.telegram.org/bot' + botToken;
+
+const appScriptUrl = ''; // isi url web yang sudah di deploy
+
+const templateDocId = ''; // isi dengan id template doc invoice
+const folderId = ''; // isi dengan id folder archive invoice
+
+
+// Webhook utama
+function doPost(e) {
+  try {
+    const contents = JSON.parse(e.postData.contents);
+    const chatId = contents.message.chat.id;
+
+    if (!contents.message.text) {
+      sendMessage(chatId, "⚠️ Hanya menerima pesan teks. Gunakan /format untuk contoh.");
+      return;
+    }
+
+    const text = contents.message.text.trim();
+
+    if (text === '/start') {
+      sendMessage(chatId, "👋 Halo! Selamat datang di *InvoiceBot*.\n\nGunakan /format untuk melihat format input.\nGunakan /kirim untuk kirim data.");
+      return;
+    }
+
+    if (text === '/format') {
+      sendMessage(chatId,
+        "📌 Format kirim data:\n\n" +
+        "Kepada: <nama client>\n" +
+        "Items: item1, item2, item3\n" +
+        "Harga: harga1, harga2, harga3\n" +
+        "Jumlah: qty1, qty2, qty3\n\n" +
+        "Contoh:\n" +
+        "Kepada: PT Sukses Makmur\n" +
+        "Items: Pensil, Pulpen, Buku Tulis\n" +
+        "Harga: 2000, 5000, 10000\n" +
+        "Jumlah: 10, 5, 2"
+      );
+      return;
+    }
+
+    if (text.startsWith('/kirim')) {
+      const dataText = text.replace('/kirim', '').trim();
+      processData(chatId, dataText);
+      return;
+    }
+
+    sendMessage(chatId, "❗ Perintah tidak dikenal. Gunakan /format untuk melihat format.");
+  } catch (err) {
+    logError("Webhook Error: " + err);
+  }
+}
+
+
+// Process Data
+function processData(chatId, dataText) {
+  try {
+    const lines = dataText.split('\n').map(l => l.trim()).filter(l => l);
+
+    let kepada = '';
+    let items = [];
+    let harga = [];
+    let jumlah = [];
+
+    lines.forEach(line => {
+      if (line.startsWith("Kepada:")) {
+        kepada = line.replace("Kepada:", "").trim();
+      } else if (line.startsWith("Items:")) {
+        items = line.replace("Items:", "").split(',').map(i => i.trim());
+      } else if (line.startsWith("Harga:")) {
+        harga = line.replace("Harga:", "").split(',').map(h => parseFloat(h.trim()) || 0);
+      } else if (line.startsWith("Jumlah:")) {
+        jumlah = line.replace("Jumlah:", "").split(',').map(j => parseInt(j.trim(), 10) || 0);
+      }
+    });
+
+    if (!kepada || items.length === 0 || harga.length === 0 || jumlah.length === 0) {
+      sendMessage(chatId, "⚠️ Data tidak lengkap! Gunakan /format untuk contoh.");
+      return;
+    }
+
+    if (!(items.length === harga.length && harga.length === jumlah.length)) {
+      sendMessage(chatId, "⚠️ Jumlah item, harga, dan qty tidak sama!");
+      return;
+    }
+
+    const ss = SpreadsheetApp.openById(spreadsheetId);
+    const sheet = ss.getSheetByName(laporanSheetName);
+    const tanggal = new Date();
+
+    // Simpan ke Sheet aman
+    appendRowsSafe(sheet, tanggal, kepada, items, harga, jumlah);
+
+    // Hitung total
+    const subTotal = items.reduce((acc, _, i) => acc + harga[i] * jumlah[i], 0);
+    const tax = subTotal * 0.11;
+    const grandTotal = subTotal + tax;
+
+    sendMessage(chatId, "✅ Data berhasil disimpan. Invoice sedang diproses...");
+
+    // Generate PDF
+    const pdfFile = generateInvoicePDF(kepada, tanggal, items, harga, jumlah, subTotal, tax, grandTotal);
+
+    // Kirim PDF ke Telegram
+    sendDocument(chatId, pdfFile);
+
+  } catch (err) {
+    logError("ProcessData Error: " + err);
+    sendMessage(chatId, "❌ Terjadi error saat memproses data.");
+  }
+}
+
+
+// AppendRows aman (pakai setValues)
+function appendRowsSafe(sheet, tanggal, kepada, items, harga, jumlah) {
+  const formattedDate = Utilities.formatDate(tanggal, Session.getScriptTimeZone(), "dd/MM/yyyy");
+  const data = [];
+
+  for (let i = 0; i < items.length; i++) {
+    const total = harga[i] * jumlah[i];
+    data.push([
+      formattedDate,
+      String(kepada),
+      String(items[i]),
+      Number(harga[i]),
+      Number(jumlah[i]),
+      Number(total)
+    ]);
+  }
+
+  const lastRow = sheet.getLastRow();
+  sheet.getRange(lastRow + 1, 1, data.length, data[0].length).setValues(data);
+}
+
+
+// Generate PDF
+function generateInvoicePDF(kepada, tanggal, items, harga, jumlah) {
+  // Buat salinan dokumen template
+  const docId = DriveApp.getFileById(templateDocId)
+    .makeCopy("Invoice - " + kepada, DriveApp.getFolderById(folderId))
+    .getId();
+
+  const doc = DocumentApp.openById(docId);
+  const body = doc.getBody();
+
+  // Hitung total
+  const subTotal = items.reduce((acc, _, i) => acc + harga[i] * jumlah[i], 0);
+  const tax = subTotal * 0.11;
+  const grandTotal = subTotal + tax;
+
+  // Generate nomor invoice unik
+  const invoiceNo = generateInvoiceNo(tanggal);
+
+  // Ganti placeholder di isi PDF
+  body.replaceText('{{INVOICE_NO}}', invoiceNo);
+  body.replaceText('{{DATE}}', Utilities.formatDate(new Date(tanggal), Session.getScriptTimeZone(), "dd/MM/yyyy"));
+  body.replaceText('{{TO}}', kepada);
+  body.replaceText('{{SUBTOTAL}}', formatRupiah(subTotal));
+  body.replaceText('{{TAX}}', formatRupiah(tax));
+  body.replaceText('{{GRAND_TOTAL}}', formatRupiah(grandTotal));
+
+  // Sisipkan tabel item
+  insertItemsTable(body, items, harga, jumlah);
+
+  // Simpan & tutup dokumen
+  doc.saveAndClose();
+
+  // Ambil file sebagai PDF
+  const file = DriveApp.getFileById(docId);
+  const pdf = file.getAs(MimeType.PDF);
+  const folder = DriveApp.getFolderById(folderId);
+
+  // Gunakan nama file lama (sesuai nama client)
+  const pdfFile = folder.createFile(pdf).setName("Invoice - " + kepada + ".pdf");
+
+  // Hapus dokumen sementara
+  file.setTrashed(true);
+
+  return pdfFile;
+}
+
+
+// Insert tabel item pada posisi placeholder {{ITEMS_TABLE}}
+function insertItemsTable(body, items, harga, jumlah) {
+  const tableData = [["Item", "Harga", "Jumlah", "Total"]];
+
+  for (let i = 0; i < items.length; i++) {
+    tableData.push([
+      String(items[i]),
+      String(formatRupiah(harga[i])),
+      String(jumlah[i]),
+      String(formatRupiah(harga[i] * jumlah[i]))
+    ]);
+  }
+
+  const search = body.findText('{{ITEMS_TABLE}}');
+  if (!search) return;
+
+  const el = search.getElement();
+  const paragraph = el.getParent().asParagraph();
+
+  // Hapus placeholder tapi tetap simpan posisi
+  el.asText().setText("");
+
+  // Sisipkan tabel tepat di bawah placeholder
+  const table = body.insertTable(body.getChildIndex(paragraph) + 1, tableData);
+
+  // Styling tabel
+  table.getRow(0).editAsText().setBold(true);
+  table.setBorderWidth(1);
+}
+
+
+// Generate Invoice Number
+function generateInvoiceNo(tanggal) {
+  const ts = Utilities.formatDate(new Date(tanggal), Session.getScriptTimeZone(), "yyyyMMddHHmmss");
+  return "INV-" + ts;
+}
+
+
+// Helper format rupiah
+function formatRupiah(number) {
+  return "Rp " + Number(number).toLocaleString('id-ID');
+}
+
+
+// Kirim pesan teks ke telegram
+function sendMessage(chatId, text) {
+  if (!text) return;
+  UrlFetchApp.fetch(botUrl + "/sendMessage", {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify({ chat_id: chatId, text: text, parse_mode: "Markdown" }),
+    muteHttpExceptions: true
+  });
+}
+
+
+// Kirim PDF ke telegram
+function sendDocument(chatId, file) {
+  try {
+    const blob = Utilities.newBlob(file.getBlob().getBytes(), 'application/pdf', file.getName());
+    UrlFetchApp.fetch(botUrl + "/sendDocument", { method: 'post', payload: { chat_id: String(chatId), document: blob }, muteHttpExceptions: true });
+  } catch (err) {
+    logError("sendDocument Error: " + err);
+    sendMessage(chatId, "❌ Gagal mengirim PDF ke Telegram.");
+  }
+}
+
+
+// Logging Error ke Sheet Log
+function logError(msg) {
+  const ss = SpreadsheetApp.openById(spreadsheetId);
+  const logSheet = ss.getSheetByName(logSheetName);
+  logSheet.appendRow([new Date(), msg]);
+}
+
+
+// Set Webhook Telegram
+function setWebhook() {
+  UrlFetchApp.fetch(botUrl + "/setWebhook", { method: "post", payload: { url: appScriptUrl } });
+}
+
+
