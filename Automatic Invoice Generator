@@ -26,18 +26,20 @@ function doPost(e) {
     const text = contents.message.text.trim();
 
     if (text === '/start') {
-      sendMessage(chatId, "👋 Halo! Selamat datang di *InvoiceBot*.\n\nGunakan /format untuk melihat format input.\nGunakan /kirim untuk kirim data.");
+      sendMessage(chatId, "👋 Halo! Selamat datang di *InvoiceBot*.");
       return;
     }
 
     if (text === '/format') {
       sendMessage(chatId,
         "📌 Format kirim data:\n\n" +
+        "/kirim\n" +
         "Kepada: <nama client>\n" +
         "Items: item1, item2, item3\n" +
         "Harga: harga1, harga2, harga3\n" +
         "Jumlah: qty1, qty2, qty3\n\n" +
         "Contoh:\n" +
+        "/kirim\n" +
         "Kepada: PT Sukses Makmur\n" +
         "Items: Pensil, Pulpen, Buku Tulis\n" +
         "Harga: 2000, 5000, 10000\n" +
@@ -267,5 +269,3 @@ function logError(msg) {
 function setWebhook() {
   UrlFetchApp.fetch(botUrl + "/setWebhook", { method: "post", payload: { url: appScriptUrl } });
 }
-
-
