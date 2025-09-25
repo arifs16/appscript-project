@@ -1,6 +1,7 @@
 /******** KONFIGURASI ********/
-const DEFAULT_REMINDER_HOURS = 24; // default H-berapa (jam)
+const DEFAULT_REMINDER_HOURS = 24; // default H (jam) jika kolom E kosong
 
+// Indeks kolom (1-based)
 const COL_TANGGAL = 1;   // A
 const COL_JAM = 2;       // B
 const COL_ACARA = 3;     // C
@@ -9,7 +10,7 @@ const COL_REMINDER = 5;  // E
 const COL_TERAKHIR = 6;  // F
 const COL_STATUS = 7;    // G
 
-function kirimReminderEmailOnly() {
+function kirimReminderEmailFromSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Jadwal");
   if (!sheet) {
@@ -20,44 +21,46 @@ function kirimReminderEmailOnly() {
   const now = new Date();
   const timezone = Session.getScriptTimeZone();
 
-  for (let r = 1; r < rows.length; r++) { // mulai index 1 = baris ke-2
+  for (let r = 1; r < rows.length; r++) { // mulai baris ke-2
     try {
       const row = rows[r];
-      let tanggalCell = row[COL_TANGGAL - 1];
-      let jamCell = row[COL_JAM - 1];
-      let acara = String(row[COL_ACARA - 1] || "").trim();
-      let emailList = String(row[COL_EMAIL - 1] || "").trim().replace(/;/g, ",");
-      let reminderHours = Number(row[COL_REMINDER - 1]) || DEFAULT_REMINDER_HOURS;
-      let terakhirDikirim = row[COL_TERAKHIR - 1];
+      const tanggalCell = row[COL_TANGGAL - 1];
+      const jamCell = row[COL_JAM - 1];
+      const acara = String(row[COL_ACARA - 1] || "").trim();
+      let emailList = String(row[COL_EMAIL - 1] || "").trim();
+      const reminderHours = Number(row[COL_REMINDER - 1]) || DEFAULT_REMINDER_HOURS;
+      const terakhirDikirim = row[COL_TERAKHIR - 1];
 
-      // validasi minimal
       if (!tanggalCell || !acara || !emailList) {
-        // isi tidak lengkap → skip
+        // data tidak lengkap -> skip
         continue;
       }
+
+      // normalize recipients (ganti ; jadi ,)
+      emailList = emailList.replace(/;/g, ",").trim();
 
       // buat Date event (gabungkan tanggal + jam)
       let eventDate = (tanggalCell instanceof Date) ? new Date(tanggalCell) : new Date(String(tanggalCell));
       if (jamCell instanceof Date) {
         eventDate.setHours(jamCell.getHours(), jamCell.getMinutes(), 0, 0);
-      } else if (typeof jamCell === "string" && /^\d{1,2}:\d{2}$/.test(jamCell)) {
+      } else if (typeof jamCell === 'string' && /^\d{1,2}:\d{2}$/.test(jamCell)) {
         const parts = jamCell.split(":").map(Number);
         eventDate.setHours(parts[0], parts[1], 0, 0);
       }
-      // hitung selisih jam sampai event
+
       const diffHours = (eventDate.getTime() - now.getTime()) / (1000 * 60 * 60);
 
-      // jika event di masa depan dan dalam rentang reminderHours => kirim
+      // kirim jika event masih di masa depan dan dalam rentang reminderHours
       if (diffHours > 0 && diffHours <= reminderHours) {
-        // Cegah duplicate: jika TerakhirDikirim sudah berada setelah threshold (event - reminderHours)
+        // hindari duplicate: jika TerakhirDikirim sudah >= (eventDate - reminderHours) => skip
         if (terakhirDikirim instanceof Date) {
           const threshold = eventDate.getTime() - reminderHours * 3600000;
           if (terakhirDikirim.getTime() >= threshold) {
-            continue; // sudah pernah dikirim untuk pengingat ini
+            continue;
           }
         }
 
-        // Siapkan email
+        // buat body email
         const subject = `Reminder: ${acara}`;
         const htmlBody = `
           <p>Halo,</p>
@@ -70,16 +73,15 @@ function kirimReminderEmailOnly() {
           <p>Terima kasih.</p>
         `;
 
-        // Kirim email (MailApp mendukung comma-separated recipients)
+        // kirim email
         MailApp.sendEmail({ to: emailList, subject: subject, htmlBody: htmlBody });
 
-        // Catat TerakhirDikirim & Status
+        // catat TerakhirDikirim & Status
         sheet.getRange(r + 1, COL_TERAKHIR).setValue(new Date());
         sheet.getRange(r + 1, COL_STATUS).setValue("Terkirim: " + Utilities.formatDate(new Date(), timezone, "yyyy-MM-dd HH:mm"));
-        Utilities.sleep(400); // jeda kecil untuk aman
+        Utilities.sleep(300); // jeda kecil untuk aman
       }
     } catch (err) {
-      // tulis error pada kolom status
       sheet.getRange(r + 1, COL_STATUS).setValue("Error: " + err.message);
       Logger.log("Error baris " + (r + 1) + ": " + err);
     }
