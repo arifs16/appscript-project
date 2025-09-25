@@ -1,0 +1,607 @@
+// kredensial
+const spreadsheetId      = '' // ganti dengan ID Spreadsheet
+const dataOrderSheetName = 'Laporan' // nama sheet
+const logSheetName       = 'Log' // nama sheet log error
+
+const botHandle      = '' // ganti dengan @namabot telegram
+const botToken       = '' // ganti dengan token bot
+const appsScriptUrl  = '' // url script dipublish
+const telegramApiUrl = `https://api.telegram.org/bot${botToken}`
+
+// 🔹 ID Folder Google Drive untuk menyimpan dokumentasi foto
+const folderId = ''   // ID folder di Google Drive
+// 🔹 ID Template Google Docs
+const templateDocId = ''     // ID template Google Docs
+// 🔹 ID Folder untuk hasil export
+const exportFolderId = ''    // ID folder tujuan untuk simpan hasil export Docs
+ 
+
+/**********************************************************
+ * LOGGING
+ **********************************************************/
+function log(logMessage = '') {
+  try {
+    const spreadsheet = SpreadsheetApp.openById(spreadsheetId);
+    const sheet = spreadsheet.getSheetByName(logSheetName);
+    const lastRow = sheet.getLastRow();
+    const row = lastRow + 1;
+    const today = new Date();
+    sheet.insertRowAfter(lastRow);
+    sheet.getRange(`A${row}`).setValue(today);
+    const text = typeof logMessage === 'string' ? logMessage : JSON.stringify(logMessage);
+    sheet.getRange(`B${row}`).setValue(text);
+  } catch(e) {
+    console.error('GAGAL LOG:', e);
+  }
+}
+function safeLog(obj) {
+  try { log(obj); } catch(e) { console.error('safeLog failed', e); }
+}
+
+
+/**********************************************************
+ * UTIL: FORMAT TANGGAL
+ **********************************************************/
+function formatDate(date) {
+  if (!(date instanceof Date)) return String(date || '');
+  const monthIndoList = ['Jan','Feb','Mar','Apr','Mei','Jun','Jul','Ags','Sep','Okt','Nov','Des'];
+  return `${date.getDate()} ${monthIndoList[date.getMonth()]} ${date.getFullYear()}`;
+}
+
+
+/**********************************************************
+ * TELEGRAM: KIRIM PESAN
+ **********************************************************/
+function sendTelegramMessage(chatId, replyToMessageId, textMessage) {
+  try {
+    const url = `${telegramApiUrl}/sendMessage`;
+    const data = {
+      parse_mode: 'HTML',
+      chat_id: chatId,
+      reply_to_message_id: replyToMessageId,
+      text: textMessage,
+      disable_web_page_preview: true
+    };
+    const options = {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(data)
+    };
+    UrlFetchApp.fetch(url, options);
+  } catch(err) {
+    safeLog({fn: 'sendTelegramMessage', err: err.toString()});
+  }
+}
+
+
+/**********************************************************
+ * TELEGRAM: FOTO → DRIVE
+ **********************************************************/
+function getHighestFileIdFromPhotoSizes(photoSizes) {
+  if (!Array.isArray(photoSizes) || photoSizes.length === 0) return null;
+  return photoSizes[photoSizes.length - 1].file_id;
+}
+
+function saveTelegramPhotoToDrive(fileId) {
+  try {
+    if (!folderId) throw new Error('folderId kosong. Isi folderId di script.');
+    const getFileRes = UrlFetchApp.fetch(`${telegramApiUrl}/getFile?file_id=${fileId}`);
+    const fileData = JSON.parse(getFileRes.getContentText());
+    if (!fileData || !fileData.result || !fileData.result.file_path) {
+      throw new Error('getFile gagal: response tidak berisi file_path. Cek token bot.');
+    }
+    const filePath = fileData.result.file_path;
+    const fileUrl = `https://api.telegram.org/file/bot${botToken}/${filePath}`;
+
+    const resp = UrlFetchApp.fetch(fileUrl);
+    const blob = resp.getBlob();
+
+    const ext = (blob.getContentType() || 'application/octet-stream').split('/').pop();
+    const name = `tg_${fileId}_${new Date().getTime()}.${ext}`;
+
+    const folder = DriveApp.getFolderById(folderId);
+    const file = folder.createFile(blob).setName(name);
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+
+    return file.getId();
+  } catch(err) {
+    safeLog({fn: 'saveTelegramPhotoToDrive', err: err.toString()});
+    return null;
+  }
+}
+
+/**
+ * Simpan semua media (photo/doc) dari 1 message.
+ * Return: array Drive fileId.
+ */
+function savePhotosFromMessage(message) {
+  const savedIds = [];
+  try {
+    if (message.photo && message.photo.length) {
+      const fid = getHighestFileIdFromPhotoSizes(message.photo);
+      if (fid) {
+        const saved = saveTelegramPhotoToDrive(fid);
+        if (saved) savedIds.push(saved);
+      }
+    }
+    if (message.document && message.document.file_id) {
+      const saved = saveTelegramPhotoToDrive(message.document.file_id);
+      if (saved) savedIds.push(saved);
+    }
+  } catch(e) {
+    safeLog({fn: 'savePhotosFromMessage', err: e.toString()});
+  }
+  return savedIds;
+}
+
+
+/**********************************************************
+ * NORMALISASI KOLOM DOKUMENTASI (opsional)
+ * - Jika sebelumnya menyimpan link, ubah ke fileId
+ **********************************************************/
+function normalizeDokumentasiColumn() {
+  const ss = SpreadsheetApp.openById(spreadsheetId);
+  const sheet = ss.getSheetByName(dataOrderSheetName);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const colIndex = 8; // H
+  const values = sheet.getRange(2, colIndex, lastRow - 1, 1).getValues();
+
+  for (let i = 0; i < values.length; i++) {
+    if (!values[i][0]) continue;
+    const links = String(values[i][0]).split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const fileIds = links.map(link => convertUrlToFileId(link)).filter(Boolean);
+    if (fileIds.length > 0) {
+      sheet.getRange(i + 2, colIndex).setValue(fileIds.join('\n'));
+    }
+  }
+}
+function convertUrlToFileId(p) {
+  if (!p) return '';
+  let m = String(p).match(/[-\w]{25,}/);
+  return m ? m[0] : '';
+}
+
+
+/**********************************************************
+ * PARSER PESAN /input
+ * (fleksibel: multi-baris kegiatan, auto bullet/number)
+ **********************************************************/
+function parseMessage(message = '') {
+  const splitted = String(message || '').split('\n');
+
+  let shift = '';
+  let jenisKegiatan = '';
+  let kegiatan = '';
+  let keterangan = '';
+
+  let kegiatanLines = [];
+  let isKegiatanSection = false;
+
+  splitted.forEach(el => {
+    const lower = el.toLowerCase().trim();
+    if (lower.startsWith('shift:')) {
+      shift = el.split(':').slice(1).join(':').trim();
+      isKegiatanSection = false;
+    }
+    else if (lower.startsWith('jenis kegiatan:')) {
+      jenisKegiatan = el.split(':').slice(1).join(':').trim();
+      isKegiatanSection = false;
+    }
+    else if (lower.startsWith('kegiatan:')) {
+      const afterColon = el.split(':').slice(1).join(':').trim();
+      if (afterColon) kegiatanLines.push(afterColon);
+      isKegiatanSection = true;
+    }
+    else if (lower.startsWith('keterangan:')) {
+      keterangan = el.split(':').slice(1).join(':').trim();
+      isKegiatanSection = false;
+    }
+    else {
+      if (isKegiatanSection && el.trim() !== '') {
+        kegiatanLines.push(el.trim());
+      }
+    }
+  });
+
+  if (kegiatanLines.length > 0) {
+    const useBullet = kegiatanLines.every(line => line.startsWith('-') || line.startsWith('•'));
+    if (useBullet) {
+      kegiatan = kegiatanLines.map(line => `• ${line.replace(/^[-•]\s*/, '')}`).join('\n');
+    } else {
+      kegiatan = kegiatanLines.map((item, idx) => `${idx + 1}. ${item}`).join('\n');
+    }
+  }
+
+  const result = { shift, jenisKegiatan, kegiatan, keterangan };
+  const isEmpty = (shift === '' && jenisKegiatan === '' && kegiatan === '' && keterangan === '');
+  return isEmpty ? false : result;
+}
+
+
+/**********************************************************
+ * SIMPAN DATA KE SHEET
+ * Kolom: A No | B ID Kegiatan | C Tanggal | D Shift | E Jenis | F Kegiatan | G Keterangan | H Dokumentasi | I ChatId
+ **********************************************************/
+function inputDataOrder(data) {
+  try {
+    const spreadsheet = SpreadsheetApp.openById(spreadsheetId);
+    const sheet = spreadsheet.getSheetByName(dataOrderSheetName);
+    const lastRow = sheet.getLastRow();
+    const row = lastRow + 1;
+
+    const number = lastRow;
+    const idKegiatan = `KEG-${number}`;
+    const today = new Date();
+
+    sheet.insertRowAfter(lastRow);
+    sheet.getRange(`A${row}`).setValue(number);
+    sheet.getRange(`B${row}`).setValue(idKegiatan);
+    sheet.getRange(`C${row}`).setValue(today);
+    sheet.getRange(`D${row}`).setValue(data['shift']);
+    sheet.getRange(`E${row}`).setValue(data['jenisKegiatan']);
+    sheet.getRange(`F${row}`).setValue(data['kegiatan']);
+    sheet.getRange(`G${row}`).setValue(data['keterangan']);
+    sheet.getRange(`H${row}`).setValue(data['dokumentasi']); // newline separated fileIds
+    sheet.getRange(`I${row}`).setValue(data['chatId']);
+
+    return { idKegiatan, row };
+  } catch(err) {
+    safeLog({fn: 'inputDataOrder', err: err.toString()});
+    return false;
+  }
+}
+
+
+/**********************************************************
+ * BANTUAN: EKSTRAK FILE ID dari teks (opsional)
+ **********************************************************/
+function extractDriveFileIds(raw) {
+  if (!raw && raw !== 0) return [];
+  const text = String(raw).trim();
+  if (!text) return [];
+
+  const parts = text.split(/\r?\n|,|;|\s+/).map(s => s.trim()).filter(Boolean);
+  const ids = [];
+
+  parts.forEach(p => {
+    let m = p.match(/\/d\/([-\w]{20,})/);
+    if (m && m[1]) { ids.push(m[1]); return; }
+    m = p.match(/[?&]id=([-\w]{20,})/);
+    if (m && m[1]) { ids.push(m[1]); return; }
+    m = p.match(/file\/d\/([-\w]{20,})/);
+    if (m && m[1]) { ids.push(m[1]); return; }
+    m = p.match(/[-\w]{25,}/);
+    if (m && m[0]) { ids.push(m[0]); return; }
+    if (!p.includes('http') && p.length >= 10 && p.length <= 100) ids.push(p);
+  });
+
+  // unik
+  const seen = {};
+  return ids.filter(x => { if (seen[x]) return false; seen[x]=true; return true; });
+}
+
+
+/**********************************************************
+ * EXPORT: SHEET → GOOGLE DOCS (TEMPLATE TABEL) + MULTI FOTO
+ * - Semua kolom rata tengah kecuali KEGIATAN (rata kiri)
+ * - Dokumentasi → foto wrap horizontal (otomatis turun ke bawah)
+ **********************************************************/
+function exportSheetToGoogleDocs() {
+  try {
+    const ss = SpreadsheetApp.openById(spreadsheetId);
+    const sheet = ss.getSheetByName(dataOrderSheetName);
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) throw new Error("Tidak ada data untuk diexport");
+
+    const data = sheet.getDataRange().getValues();
+    const rows = data.slice(1);
+
+    const templateFile = DriveApp.getFileById(templateDocId);
+    const exportFolder = DriveApp.getFolderById(exportFolderId);
+    const newFile = templateFile.makeCopy(`Laporan_${new Date().getTime()}`, exportFolder);
+    const doc = DocumentApp.openById(newFile.getId());
+    const body = doc.getBody();
+
+    let table = null;
+    for (let i = 0; i < body.getNumChildren(); i++) {
+      const el = body.getChild(i);
+      if (el.getType() === DocumentApp.ElementType.TABLE) {
+        table = el.asTable();
+        break;
+      }
+    }
+    if (!table) throw new Error("Template tidak memiliki tabel");
+
+    const templateRowIndex = table.getNumRows() - 1;
+    const templateRow = table.getRow(templateRowIndex);
+
+    rows.forEach(r => {
+      const NO   = r[0] || '';
+      const TGL  = (r[2] instanceof Date) ? formatDate(r[2]) : (r[2] ? formatDate(new Date(r[2])) : '');
+      const SHIFT= r[3] || '';
+      const JENIS= r[4] || '';
+      const KEG  = r[5] || '';
+      const KET  = r[6] || '';
+      const DOKS = String(r[7] || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+
+      const cloned = templateRow.copy();
+      table.appendTableRow(cloned);
+      const newRow = table.getRow(table.getNumRows() - 1);
+
+      for (let c = 0; c < newRow.getNumCells(); c++) {
+        const cell = newRow.getCell(c);
+        const templateText = templateRow.getCell(c).getText();
+
+        let text = templateText;
+        text = text.replace(/\{\{\s*NO\s*\}\}/gi, String(NO));
+        text = text.replace(/\{\{\s*TANGGAL\s*\}\}/gi, String(TGL));
+        text = text.replace(/\{\{\s*SHIFT\s*\}\}/gi, String(SHIFT));
+        text = text.replace(/\{\{\s*JENIS KEGIATAN\s*\}\}/gi, String(JENIS));
+        text = text.replace(/\{\{\s*KEGIATAN\s*\}\}/gi, String(KEG));
+        text = text.replace(/\{\{\s*KETERANGAN\s*\}\}/gi, String(KET));
+
+        if (/\{\{\s*DOKUMENTASI\s*\}\}/i.test(templateText)) {
+          // === PERBAIKAN: semua foto wrap horizontal ===
+          cell.clear();
+          if (DOKS.length === 0) {
+            cell.appendParagraph("—");
+          } else {
+            const p = cell.appendParagraph(''); // satu paragraf
+            DOKS.forEach(id => {
+              try {
+                const file = DriveApp.getFileById(id);
+                const blob = file.getBlob();
+                const img = p.appendInlineImage(blob);
+                img.setWidth(80);
+                img.setHeight(60);
+                // beri spasi antar foto
+                p.appendText(' ');
+              } catch (e) {
+                p.appendText("❌ ");
+              }
+            });
+          }
+          try {
+            cell.setVerticalAlignment(DocumentApp.VerticalAlignment.CENTER)
+                .setTextAlignment(DocumentApp.TextAlignment.CENTER);
+          } catch(_) {}
+        } else {
+          // === Kolom selain dokumentasi ===
+          cell.clear();
+          cell.appendParagraph(text);
+
+          try {
+            cell.setVerticalAlignment(DocumentApp.VerticalAlignment.CENTER);
+            if (/KEGIATAN/i.test(templateText)) {
+              // khusus KEGIATAN rata kiri
+              cell.setTextAlignment(DocumentApp.TextAlignment.LEFT);
+            } else {
+              // default rata tengah
+              cell.setTextAlignment(DocumentApp.TextAlignment.CENTER);
+            }
+          } catch(_) {}
+        }
+      }
+    });
+
+    try { table.removeRow(templateRowIndex); } catch(_) {}
+    doc.saveAndClose();
+    newFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    return newFile.getUrl();
+
+  } catch (err) {
+    safeLog({fn:'exportSheetToGoogleDocs', err: err.toString()});
+    return null;
+  }
+}
+
+
+
+/**********************************************************
+ * EXPORT PDF (membuat Docs dulu lalu export ke PDF)
+ **********************************************************/
+function exportSheetToPDF() {
+  try {
+    const docUrl = exportSheetToGoogleDocs();
+    if (!docUrl) return null;
+
+    const fileIdMatch = docUrl.match(/[-\w]{25,}/);
+    if (!fileIdMatch) throw new Error('Gagal ambil Doc ID dari URL');
+    const docId = fileIdMatch[0];
+
+    const docFile = DriveApp.getFileById(docId);
+    const blob = docFile.getAs(MimeType.PDF);
+
+    const exportFolder = DriveApp.getFolderById(exportFolderId);
+    const pdfFile = exportFolder.createFile(blob).setName(docFile.getName() + ".pdf");
+    pdfFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+
+    return pdfFile.getUrl();
+  } catch (err) {
+    safeLog({fn:'exportSheetToPDF', err: err.toString()});
+    return null;
+  }
+}
+
+
+/**********************************************************
+ * WEBHOOK HANDLER
+ * - Menangani album (media_group_id) via PropertiesService.
+ *   - Kunci: mg:<chatId>:<media_group_id>
+ *   - Simpan: daftar fileId dan row sheet tujuan (jika sudah dibuat)
+ **********************************************************/
+function doPost(e) {
+  try {
+    const contents = JSON.parse(e.postData.contents);
+    const message = contents.message || contents.edited_message;
+    if (!message) return;
+
+    const chatId    = message.chat.id;
+    const messageId = message.message_id;
+    const mgid      = message.media_group_id || '';              // album id jika ada
+    const mgKey     = mgid ? `mg:${chatId}:${mgid}` : '';        // key PropertiesService
+
+    const rawText = (message.text && typeof message.text === 'string')
+      ? message.text
+      : (message.caption && typeof message.caption === 'string' ? message.caption : '');
+    const receivedTextMessage = (rawText || '').replace(botHandle, '').trim();
+    const firstLine = receivedTextMessage.split('\n')[0].trim().toLowerCase();
+
+    const props = PropertiesService.getScriptProperties();
+
+    // ====== COMMANDS ======
+    if (firstLine === '/start') {
+      sendTelegramMessage(chatId, messageId, `Halo! Bot Laporan Harian aktif. Siap membantu pekerjaan anda 😁`);
+      return;
+    }
+    if (firstLine === '/format') {
+      sendTelegramMessage(chatId, messageId,
+`Gunakan format berikut untuk mengirim laporan :
+
+/input
+Shift: 
+Jenis Kegiatan: 
+Kegiatan: 
+Keterangan: 
+
+Kirimkan foto (bisa lebih dari satu sebagai album). Caption /input boleh ditempel di salah satu foto dalam album.`);
+      return;
+    }
+    if (firstLine === '/export') {
+      const url = exportSheetToGoogleDocs();
+      const msg = url ? `Laporan berhasil dibuat. Lihat file dibawah ini 👇 \n${url}` : 'Export gagal, cek log.';
+      sendTelegramMessage(chatId, messageId, msg);
+      return;
+    }
+    if (firstLine === '/exportpdf') {
+      const url = exportSheetToPDF();
+      const msg = url ? `PDF berhasil dibuat. Lihat file dibawah ini 👇 \n${url}` : 'Export PDF gagal, cek log.';
+      sendTelegramMessage(chatId, messageId, msg);
+      return;
+    }
+
+    // ====== SIMPAN FOTO (SETIAP UPDATE YANG ADA MEDIA) ======
+    if (message.photo || message.document) {
+      const ids = savePhotosFromMessage(message); // array
+      if (ids.length) {
+        if (mgKey) {
+          // gabung ke daftar id di properti mgKey
+          const old = props.getProperty(mgKey + ':ids') || '';
+          const arr = old ? old.split('\n') : [];
+          ids.forEach(id => { if (id) arr.push(id); });
+          // unik
+          const seen = {};
+          const uniq = arr.filter(x => { if (seen[x]) return false; seen[x]=true; return true; });
+          props.setProperty(mgKey + ':ids', uniq.join('\n'));
+
+          // jika baris sudah dibuat (karena caption /input sudah masuk lebih dulu), update kolom H
+          const rowStr = props.getProperty(mgKey + ':row');
+          if (rowStr) {
+            const row = parseInt(rowStr, 10);
+            const sheet = SpreadsheetApp.openById(spreadsheetId).getSheetByName(dataOrderSheetName);
+            sheet.getRange(row, 8).setValue(uniq.join('\n')); // kolom H
+          }
+        } else {
+          // media tunggal (bukan album) → simpan sementara
+          const old = props.getProperty('last_single_photo:' + chatId) || '';
+          const arr = old ? old.split('\n') : [];
+          ids.forEach(id => { if (id) arr.push(id); });
+          const seen = {};
+          const uniq = arr.filter(x => { if (seen[x]) return false; seen[x]=true; return true; });
+          props.setProperty('last_single_photo:' + chatId, uniq.join('\n'));
+        }
+      }
+    }
+
+    // ====== HANDLE /input ======
+    if (firstLine === '/input') {
+      const parsedMessage = parseMessage(receivedTextMessage);
+      if (!parsedMessage) {
+        sendTelegramMessage(chatId, messageId, 'Format data tidak lengkap atau kosong. Ketik /format untuk contoh.');
+        return;
+      }
+
+      // kumpulkan semua id foto sementara
+      let ids = [];
+      if (mgKey) {
+        const s = props.getProperty(mgKey + ':ids') || '';
+        if (s) ids = ids.concat(s.split('\n').map(x => x.trim()).filter(Boolean));
+      } else {
+        const s = props.getProperty('last_single_photo:' + chatId) || '';
+        if (s) ids = ids.concat(s.split('\n').map(x => x.trim()).filter(Boolean));
+      }
+
+      // 🔹 Delay adaptif: kasih waktu supaya semua foto album masuk
+      let waitMs = 1000;
+      if (ids.length > 4) waitMs = 2000;
+      if (ids.length > 8) waitMs = 3000;
+      Utilities.sleep(waitMs);
+
+      // cek ulang setelah delay
+      ids = [];
+      if (mgKey) {
+        const s = props.getProperty(mgKey + ':ids') || '';
+        if (s) ids = ids.concat(s.split('\n').map(x => x.trim()).filter(Boolean));
+      } else {
+        const s = props.getProperty('last_single_photo:' + chatId) || '';
+        if (s) ids = ids.concat(s.split('\n').map(x => x.trim()).filter(Boolean));
+      }
+
+      // fallback: kalau ada link Drive di caption/keterangan
+      if (ids.length === 0) {
+        ids = ids.concat(extractDriveFileIds(receivedTextMessage));
+        ids = ids.concat(extractDriveFileIds(parsedMessage.keterangan));
+      }
+      // unik
+      const seen = {};
+      const uniq = ids.filter(x => { if (seen[x]) return false; seen[x]=true; return true; });
+      const dokumentasiLinks = uniq.join('\n');
+
+      // simpan ke sheet
+      const res = inputDataOrder({
+        shift: parsedMessage.shift,
+        jenisKegiatan: parsedMessage.jenisKegiatan,
+        kegiatan: parsedMessage.kegiatan,
+        keterangan: parsedMessage.keterangan,
+        dokumentasi: dokumentasiLinks,
+        chatId: chatId
+      });
+
+      if (res && res.row) {
+        // jika ini album, ingatkan row supaya foto susulan bisa menambah kolom H
+        if (mgKey) {
+          props.setProperty(mgKey + ':row', String(res.row));
+        } else {
+          props.deleteProperty('last_single_photo:' + chatId);
+        }
+        const reply = res.idKegiatan
+          ? `Data berhasil disimpan dengan ID Kegiatan <b>${res.idKegiatan}</b>.`
+          : 'Data berhasil disimpan.';
+        sendTelegramMessage(chatId, messageId, reply + ' Lanjutkan bekerja 😁');
+      } else {
+        sendTelegramMessage(chatId, messageId, 'Data gagal disimpan (cek log).');
+      }
+      return;
+    }
+
+    // ====== fallback pesan lain ======
+    if (!message.photo && !message.document) {
+      sendTelegramMessage(chatId, messageId, `Pesan tidak sesuai format. Ketik /format untuk melihat contoh.`);
+    }
+
+  } catch(err) {
+    safeLog({fn: 'doPost', err: err.toString(), raw: e.postData && e.postData.contents ? e.postData.contents : null});
+  }
+}
+
+
+/**********************************************************
+ * SET WEBHOOK
+ **********************************************************/
+function setWebhook() {
+  const url      = `${telegramApiUrl}/setwebhook?url=${encodeURIComponent(appsScriptUrl)}`
+  const response = UrlFetchApp.fetch(url).getContentText()
+  Logger.log(response)
+}
