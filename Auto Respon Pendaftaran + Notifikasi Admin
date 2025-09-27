@@ -1,0 +1,56 @@
+function sendEmailOnFormSubmit(e) {
+  var responses = e.values; 
+  var timestamp = responses[0];
+  var nama = responses[1];
+  var email = responses[2];
+  var wa = responses[3];
+  var instansi = responses[4];
+  
+  // ========================
+  // 1. Notifikasi ke Admin
+  // ========================
+  var adminEmail = ""; // isi dengan email admin
+  var subjectAdmin = "Pendaftar Baru: " + nama;
+  
+  var bodyAdmin = `
+    <p>Halo <b>Panitia</b>,</p>
+    <p>Ada pendaftar baru untuk seminar:</p>
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;">
+      <tr><td><b>Nama</b></td><td>${nama}</td></tr>
+      <tr><td><b>Email</b></td><td>${email}</td></tr>
+      <tr><td><b>WhatsApp</b></td><td>${wa}</td></tr>
+      <tr><td><b>Instansi</b></td><td>${instansi}</td></tr>
+      <tr><td><b>Waktu Daftar</b></td><td>${timestamp}</td></tr>
+    </table>
+    <p>Salam,<br><i>Google Form Bot</i></p>
+  `;
+  
+  MailApp.sendEmail({
+    to: adminEmail,
+    subject: subjectAdmin,
+    htmlBody: bodyAdmin
+  });
+  
+  // ========================
+  // 2. Konfirmasi ke Peserta, ganti link zoom, dengan link yang baru
+  // ========================
+  var subjectUser = "Konfirmasi Pendaftaran Seminar Online";
+  var bodyUser = `
+    <p>Halo <b>${nama}</b>,</p>
+    <p>Terima kasih sudah mendaftar <b>Seminar Online</b> dengan detail sebagai berikut:</p>
+    <ul>
+      <li><b>Tema:</b> AI dan Masa Depan Pekerjaan</li>
+      <li><b>Tanggal:</b> 30 September 2025</li>
+      <li><b>Waktu:</b> 19.00 WIB</li>
+      <li><b>Link Zoom:</b> <a href="https://zoom.us/j/1234567890" target="_blank">Klik di sini untuk Join</a></li>
+    </ul>
+    <p>Simpan email ini sebagai <b>bukti pendaftaran</b>.</p>
+    <p>Salam,<br><b>Panitia Seminar</b></p>
+  `;
+  
+  MailApp.sendEmail({
+    to: email,
+    subject: subjectUser,
+    htmlBody: bodyUser
+  });
+}
